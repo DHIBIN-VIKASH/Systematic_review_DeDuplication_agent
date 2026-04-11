@@ -5,7 +5,20 @@ import glob
 import pandas as pd
 import csv
 import json
+import logging
+import argparse
 from datetime import datetime
+
+# Structured logging — outputs to both console and run.log
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler("dedup_run.log", mode='a', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 def normalize_text(text):
     if not text:
@@ -21,7 +34,7 @@ def title_similarity(a, b):
     return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
 class Record:
-    def __init__(self, source_file, original_text, pmid=None, doi=None, title=None, authors=None, year=None, extra_data=None):
+    def __init__(self, source_file, original_text, pmid=None, doi=None, title=None, authors=None, year=None, abstract=None, extra_data=None):
         self.source_file = source_file
         self.original_text = original_text
         self.pmid = str(pmid).strip() if pmid and str(pmid).strip().lower() != 'nan' else None
@@ -36,6 +49,7 @@ class Record:
             
         self.title = str(title).strip() if title and str(title).strip().lower() != 'nan' else ""
         self.normalized_title = normalize_text(self.title)
+        self.abstract = str(abstract).strip() if abstract and str(abstract).strip().lower() != 'nan' else ""
         
         if isinstance(authors, list):
             self.authors = [str(a) for a in authors]
@@ -48,30 +62,37 @@ class Record:
         self.extra_data = extra_data or {}
 
     def is_duplicate_of(self, other):
-        """Check if this record is a duplicate. Returns (is_dup, method, confidence)."""
         # 1. DOI Match (Strongest)
         if self.doi and other.doi and self.doi == other.doi:
-            return True, "DOI", 1.0
+            return True
         
         # 2. PMID Match
         if self.pmid and other.pmid and self.pmid == other.pmid:
-            return True, "PMID", 1.0
+            return True
 
         # 3. Exact Normalized Title Match (if title is long enough)
         if self.normalized_title and other.normalized_title and len(self.normalized_title) > 30: 
             if self.normalized_title == other.normalized_title:
-                return True, "ExactTitle", 0.99
+                return True
 
         # 4. Title Similarity (95%+)
         if self.title and other.title and abs(len(self.title) - len(other.title)) < 40: 
             sim = title_similarity(self.title, other.title)
             if sim >= 0.95:
-                return True, "TitleSimilarity", sim
-            # Relaxed match if year also matches
+                return True
+            # Relaxed match if year also matches + author confirmation
             if sim >= 0.85 and self.year and other.year and self.year == other.year:
-                return True, "TitleYear", sim
+                # Additional author confirmation to reduce false positives
+                if self.authors and other.authors:
+                    a1 = self.authors[0].split(',')[0].strip().lower()
+                    a2 = other.authors[0].split(',')[0].strip().lower()
+                    if a1 and a2 and (a1 in a2 or a2 in a1):
+                        return True
+                else:
+                    # No author data — fall back to title+year match
+                    return True
         
-        return False, None, 0.0
+        return False
 
 def parse_pubmed(filename):
     records = []
@@ -91,6 +112,7 @@ def parse_pubmed(filename):
               re.search(r'^AID - (.*) \[doi\]', block, re.M) or \
               re.search(r'^SO  - .*?doi: (.*?)\.', block, re.M)
         title = re.search(r'^TI  - (.*?)(?=\n[A-Z]{2,4} - |\n\n|$)', block, re.S | re.M)
+        abstract = re.search(r'^AB  - (.*?)(?=\n[A-Z]{2,4} - |\n\n|$)', block, re.S | re.M)
         year = re.search(r'^DP  - (\d{4})', block, re.M)
         authors = re.findall(r'^FAU - (.*)', block, re.M)
         
@@ -98,12 +120,17 @@ def parse_pubmed(filename):
         if title:
             t_str = " ".join(line.strip() for line in title.group(1).split('\n'))
 
+        ab_str = ""
+        if abstract:
+            ab_str = " ".join(line.strip() for line in abstract.group(1).split('\n'))
+
         records.append(Record(
             source_file=filename,
             original_text=block,
             pmid=pmid.group(1).strip() if pmid else None,
             doi=doi.group(1).strip() if doi else None,
             title=t_str,
+            abstract=ab_str,
             authors=authors,
             year=year.group(1).strip() if year else None
         ))
@@ -120,24 +147,31 @@ def parse_bib(filename):
     
     entries = re.findall(r'@\w+\s*\{.*?\n\}', content, re.S)
     for entry in entries:
-        title_match = re.search(r'title\s*=\s*[\{"](.*?)[}\"],', entry, re.S | re.I) or \
+        title_match = re.search(r'title\s*=\s*[\{"](.*?)[}\\"],', entry, re.S | re.I) or \
                       re.search(r'title\s*=\s*\{(.*)\}', entry, re.S | re.I)
-        doi_match = re.search(r'doi\s*=\s*[\{"](.*?)[}\"]', entry, re.S | re.I)
-        year_match = re.search(r'year\s*=\s*[\{"]?(\d{4})[\"\}]?', entry, re.S | re.I)
-        author_match = re.search(r'author\s*=\s*[\{"](.*?)[}\"]', entry, re.S | re.I)
+        abstract_match = re.search(r'abstract\s*=\s*[\{"](.*?)[}\\"]', entry, re.S | re.I)
+        doi_match = re.search(r'doi\s*=\s*[\{"](.*?)[}\\"]', entry, re.S | re.I)
+        year_match = re.search(r'year\s*=\s*[\{"]?(\d{4})[\\"\}]?', entry, re.S | re.I)
+        author_match = re.search(r'author\s*=\s*[\{"](.*?)[}\\"]', entry, re.S | re.I)
         
         t_str = ""
         if title_match:
             t_str = " ".join(line.strip() for line in title_match.group(1).split('\n'))
             t_str = re.sub(r'[\{\}]', '', t_str)
 
+        ab_str = ""
+        if abstract_match:
+            ab_str = " ".join(line.strip() for line in abstract_match.group(1).split('\n'))
+            ab_str = re.sub(r'[\{\}]', '', ab_str)
+
         records.append(Record(
             source_file=filename,
             original_text=entry,
             doi=doi_match.group(1).strip() if doi_match else None,
             title=t_str,
+            abstract=ab_str,
             authors=author_match.group(1).split(' and ') if author_match else [],
-            year=year_match.group(1).strip() if year_match else None
+            year=year_match.group(1).strip() if year else None
         ))
     return records
 
@@ -155,17 +189,22 @@ def parse_ris(filename):
         if not entry.strip(): continue
         
         title_match = re.search(r'^(?:TI|T1)\s+-\s+(.*)', entry, re.M | re.I)
+        abstract_match = re.search(r'^(?:AB|N2)\s+-\s+(.*?)(?=\n[A-Z][A-Z0-9]\s+-|$)', entry, re.S | re.M | re.I)
         doi_match = re.search(r'^DO\s+-\s+(.*)', entry, re.M | re.I)
         year_match = re.search(r'^(?:PY|Y1)\s+-\s+(\d{4})', entry, re.M | re.I)
         authors = re.findall(r'^AU\s+-\s+(.*)', entry, re.M | re.I)
         
         t_str = title_match.group(1).strip() if title_match else ""
+        ab_str = ""
+        if abstract_match:
+            ab_str = " ".join(line.strip() for line in abstract_match.group(1).split('\n'))
 
         records.append(Record(
             source_file=filename,
             original_text=entry + "\nER  -",
             doi=doi_match.group(1).strip() if doi_match else None,
             title=t_str,
+            abstract=ab_str,
             authors=authors,
             year=year_match.group(1).strip() if year_match else None
         ))
@@ -190,6 +229,7 @@ def parse_csv(filename):
     # Map headers
     cols = df.columns
     title_col = next((c for c in cols if any(x in c.lower() for x in ['title', 'ti', 'document name'])), None)
+    abstract_col = next((c for c in cols if any(x in c.lower() for x in ['abstract', 'ab'])), None)
     doi_col = next((c for c in cols if any(x in c.lower() for x in ['doi', 'do', 'digital object identifier'])), None)
     pmid_col = next((c for c in cols if any(x in c.lower() for x in ['pmid', 'pubmed id', 'pm'])), None)
     author_col = next((c for c in cols if any(x in c.lower() for x in ['author', 'au', 'contributor'])), None)
@@ -197,6 +237,7 @@ def parse_csv(filename):
 
     for _, row in df.iterrows():
         title = row[title_col] if title_col else ""
+        abstract = row[abstract_col] if abstract_col else ""
         doi = row[doi_col] if doi_col else None
         pmid = row[pmid_col] if pmid_col else None
         authors = row[author_col] if author_col else ""
@@ -211,6 +252,7 @@ def parse_csv(filename):
             pmid=pmid,
             doi=doi,
             title=title,
+            abstract=abstract,
             authors=str(authors).split(';') if authors else [],
             year=year,
             extra_data=row.to_dict()
@@ -245,81 +287,41 @@ def detect_and_parse(filename):
     
     return [], None
 
-def process_file(records, label, master_seen_dois, master_seen_titles, master_unique_list, audit_log):
-    print(f"Deduplicating {label}...")
+def process_file(records, label, master_seen_dois, master_seen_titles, master_unique_list):
+    logger.info(f"Deduplicating {label} ({len(records)} input records)...")
     local_unique = []
     skipped = 0
-    flagged_for_review = []
-    
+    skipped_by = {'doi': 0, 'title_exact': 0, 'fuzzy': 0}
     for r in records:
-        # Check against master DOI index first
+        # Check against master first
         if r.doi and r.doi in master_seen_dois:
             skipped += 1
-            audit_log.append({
-                "action": "removed", "method": "DOI_index", "confidence": 1.0,
-                "source_file": r.source_file, "title": r.title[:100], "doi": r.doi
-            })
+            skipped_by['doi'] += 1
             continue
         if r.normalized_title and r.normalized_title in master_seen_titles and len(r.normalized_title) > 30:
             skipped += 1
-            audit_log.append({
-                "action": "removed", "method": "ExactTitle_index", "confidence": 0.99,
-                "source_file": r.source_file, "title": r.title[:100]
-            })
+            skipped_by['title_exact'] += 1
             continue
             
         is_dup = False
-        dup_method = None
-        dup_confidence = 0.0
-        matched_record = None
         for u in master_unique_list:
-            result = r.is_duplicate_of(u)
-            if result[0]:
+            if r.is_duplicate_of(u):
                 is_dup = True
-                dup_method = result[1]
-                dup_confidence = result[2]
-                matched_record = u
                 break
         
         if is_dup:
-            # Conservative retention: if confidence is in uncertain range, keep both and flag
-            if dup_method == "TitleYear" and dup_confidence < 0.92:
-                # Uncertain match — retain both, flag for human review
-                local_unique.append(r)
-                master_unique_list.append(r)
-                if r.doi: master_seen_dois.add(r.doi)
-                if r.normalized_title: master_seen_titles.add(r.normalized_title)
-                flagged_for_review.append({
-                    "record_title": r.title[:100],
-                    "matched_title": matched_record.title[:100] if matched_record else "",
-                    "method": dup_method, "confidence": round(dup_confidence, 4),
-                    "reason": "Low-confidence match retained for human review"
-                })
-                audit_log.append({
-                    "action": "flagged_retained", "method": dup_method, "confidence": round(dup_confidence, 4),
-                    "source_file": r.source_file, "title": r.title[:100],
-                    "matched_title": matched_record.title[:100] if matched_record else ""
-                })
-            else:
-                skipped += 1
-                audit_log.append({
-                    "action": "removed", "method": dup_method, "confidence": round(dup_confidence, 4),
-                    "source_file": r.source_file, "title": r.title[:100],
-                    "matched_title": matched_record.title[:100] if matched_record else ""
-                })
+            skipped += 1
+            skipped_by['fuzzy'] += 1
             continue
         
         local_unique.append(r)
         master_unique_list.append(r)
         if r.doi: master_seen_dois.add(r.doi)
         if r.normalized_title: master_seen_titles.add(r.normalized_title)
-        audit_log.append({
-            "action": "kept", "method": "unique", "confidence": 1.0,
-            "source_file": r.source_file, "title": r.title[:100]
-        })
             
-    print(f"  - Kept {len(local_unique)} records, removed {skipped} duplicates, flagged {len(flagged_for_review)} for review.")
-    return local_unique, flagged_for_review
+    logger.info(f"  → Kept {len(local_unique)}, removed {skipped} duplicates "
+                f"(DOI: {skipped_by['doi']}, Title-exact: {skipped_by['title_exact']}, Fuzzy: {skipped_by['fuzzy']})")
+    return local_unique, len(records)
 
 def save_records(records, original_filename, format_label):
     if not records:
@@ -358,6 +360,13 @@ def save_records(records, original_filename, format_label):
     print(f"Saved to {out_name}")
 
 def main():
+    parser = argparse.ArgumentParser(description="Deduplicate bibliographic files.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Parse and report counts without saving output files.")
+    args = parser.parse_args()
+
+    logger.info(f"=== Deduplication Run Started at {datetime.now().isoformat()} ===")
+
     # Find all potential files
     extensions = ['*.txt', '*.bib', '*.ris', '*.csv', '*.nbib', '*.ciw', '*.enw']
     files = []
@@ -368,20 +377,17 @@ def main():
     files = [f for f in files if '_deduplicated' not in f and f not in ['deduplicate_files.py', 'count_records.py', 'verify_clean.py']]
     
     if not files:
-        print("No input files found in the current directory.")
-        print(f"Supported extensions: {', '.join(extensions)}")
+        logger.warning("No input files found in the current directory.")
+        logger.info(f"Supported extensions: {', '.join(extensions)}")
         return
 
-    print(f"Found {len(files)} files to process: {', '.join(files)}")
+    logger.info(f"Found {len(files)} files to process: {', '.join(files)}")
 
     master_seen_dois = set()
     master_seen_titles = set()
     master_unique_list = []
-    audit_log = []  # Structured audit log for all decisions
-    all_flagged = []  # Records flagged for human review
 
     all_processed = []
-    file_record_counts = {}  # Track original counts per file
 
     # Process in a stable order (alphabetical) or maybe prioritized?
     # Usually PubMed/Cochrane are higher quality.
@@ -390,67 +396,76 @@ def main():
     for f in files:
         records, format_label = detect_and_parse(f)
         if not format_label:
-            print(f"Could not detect format for {f}, skipping.")
+            logger.warning(f"Could not detect format for {f}, skipping.")
             continue
         
-        file_record_counts[f] = len(records)
-        print(f"Detected format: {format_label} for {f} ({len(records)} records)")
-        deduped, flagged = process_file(records, f, master_seen_dois, master_seen_titles, master_unique_list, audit_log)
-        all_flagged.extend(flagged)
-        all_processed.append((deduped, f, format_label))
+        logger.info(f"Detected format: {format_label} for {f}")
+        deduped, original_count = process_file(records, f, master_seen_dois, master_seen_titles, master_unique_list)
+        all_processed.append((deduped, f, format_label, original_count))
 
-    # Summary statistics
-    total_input = sum(file_record_counts.values())
-    total_output = sum(len(d) for d, _, _ in all_processed)
-    total_removed = len([e for e in audit_log if e["action"] == "removed"])
-    total_flagged = len([e for e in audit_log if e["action"] == "flagged_retained"])
+    # Summary
+    logger.info("\n" + "="*50)
+    logger.info("DEDUPLICATION SUMMARY")
+    logger.info("="*50)
+    total_in = 0
+    total_out = 0
+    for deduped, f, _, original_count in all_processed:
+        removed = original_count - len(deduped)
+        logger.info(f"  {f}: {original_count} in → {len(deduped)} kept ({removed} duplicates removed)")
+        total_in += original_count
+        total_out += len(deduped)
     
-    # Count by method
-    method_counts = {}
-    for entry in audit_log:
-        if entry["action"] == "removed":
-            m = entry["method"]
-            method_counts[m] = method_counts.get(m, 0) + 1
+    logger.info(f"  TOTAL: {total_in} in → {total_out} kept ({total_in - total_out} duplicates removed)")
 
-    print("\n" + "="*50)
-    print("DEDUPLICATION SUMMARY")
-    print("="*50)
-    print(f"Total input records:    {total_input}")
-    print(f"Total unique records:   {total_output}")
-    print(f"Total duplicates:       {total_removed}")
-    print(f"Flagged for review:     {total_flagged}")
-    print(f"\nDuplicates by method:")
-    for method, count in sorted(method_counts.items(), key=lambda x: -x[1]):
-        print(f"  {method}: {count}")
-    print(f"\nPer-file breakdown:")
-    for deduped, f, _ in all_processed:
-        orig = file_record_counts.get(f, '?')
-        print(f"  {f}: {orig} input → {len(deduped)} kept")
+    if args.dry_run:
+        logger.info("\n[DRY RUN] No files were saved.")
+        return
 
-    # Save results
-    print("\nSaving files...")
-    for deduped, f, format_label in all_processed:
+    # Save per-format deduplicated files
+    logger.info("\nSaving deduplicated files...")
+    for deduped, f, format_label, _ in all_processed:
         save_records(deduped, f, format_label)
 
-    # Save structured audit log
-    audit_output = {
-        "timestamp": datetime.now().isoformat(),
-        "summary": {
-            "total_input": total_input,
-            "total_unique": total_output,
-            "total_duplicates_removed": total_removed,
-            "total_flagged_for_review": total_flagged,
-            "duplicates_by_method": method_counts,
-            "files_processed": file_record_counts
-        },
-        "flagged_for_human_review": all_flagged,
-        "decisions": audit_log
-    }
-    with open("dedup_audit_log.json", "w", encoding="utf-8") as f:
-        json.dump(audit_output, f, indent=2, ensure_ascii=False)
-    print(f"\nAudit log saved to dedup_audit_log.json")
+    # Export master deduplicated CSV across all input files (with title + abstract)
+    all_unique = [r for deduped, _, _, _ in all_processed for r in deduped]
+    if all_unique:
+        master_df = pd.DataFrame([{
+            'title': r.title,
+            'abstract': r.abstract or '',
+            'doi': r.doi or '',
+            'pmid': r.pmid or '',
+            'year': r.year or '',
+            'authors': '; '.join(r.authors) if r.authors else '',
+            'source_file': r.source_file
+        } for r in all_unique])
+        master_df.to_csv('master_deduplicated.csv', index=False)
+        logger.info(f"Master CSV saved: master_deduplicated.csv ({len(master_df)} unique records)")
 
-    print("\nAll tasks completed.")
+        # Also count records missing title or abstract as a quality check
+        missing_title = master_df['title'].eq('').sum()
+        missing_abstract = master_df['abstract'].eq('').sum()
+        if missing_title > 0:
+            logger.warning(f"  {missing_title} records have no title")
+        if missing_abstract > 0:
+            logger.warning(f"  {missing_abstract} records have no abstract (may need manual review)")
+
+    # Save run summary as JSON for audit
+    summary = {
+        'timestamp': datetime.now().isoformat(),
+        'files_processed': len(all_processed),
+        'total_input_records': total_in,
+        'total_unique_records': total_out,
+        'total_duplicates_removed': total_in - total_out,
+        'per_file': [
+            {'file': f, 'format': fmt, 'input': orig, 'output': len(d), 'removed': orig - len(d)}
+            for d, f, fmt, orig in all_processed
+        ]
+    }
+    with open('dedup_summary.json', 'w', encoding='utf-8') as jf:
+        json.dump(summary, jf, indent=2)
+    logger.info("Run summary saved: dedup_summary.json")
+
+    logger.info("\nAll tasks completed.")
 
 if __name__ == "__main__":
     main()
